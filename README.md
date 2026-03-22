@@ -1,17 +1,12 @@
-# Gramps Web API
+# Lineage API
 
-This is the repository for **Gramps Web API**, a Python REST API for [Gramps](https://gramps-project.org).
+**Lineage API** is the Python REST API backend for [Lineage](https://github.com/AijooseFactory/Lineage), a genealogy intelligence platform.
 
-It allows to query and manipulate a [Gramps](https://gramps-project.org) family tree database via the web.
+It provides structured access to the Gramps genealogy database — querying and manipulating people, families, events, places, sources, citations, notes, repositories, and media — and serves as the canonical data layer for all Lineage features including evidence review, dataset generation, and AI-assisted research workflows.
 
-Gramps Web API is the backend of [Gramps Web](https://www.grampsweb.org/), a genealogy web app based on Gramps, but can also be used as backend for other tools.
+Built on a fork of [Gramps Web API](https://github.com/gramps-project/gramps-web-api).
 
-## More information
+## Related
 
-- API documentation for Gramps Web API: https://gramps-project.github.io/gramps-web-api/
-- Developer documentation for Gramps Web API: https://www.grampsweb.org/dev-backend/
-- Documentation for Gramps Web: https://www.grampsweb.org
-
-## Related projects
-
-- Gramps Web frontend repository: https://github.com/gramps-project/gramps-web
+- **[Lineage](https://github.com/AijooseFactory/Lineage)** — Frontend application
+- **Upstream**: [gramps-project/gramps-web-api](https://github.com/gramps-project/gramps-web-api)
