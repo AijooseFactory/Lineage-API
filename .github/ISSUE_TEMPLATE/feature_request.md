@@ -1,20 +1,19 @@
 ---
 name: Feature request
-about: Suggest an idea for this project
-title: ''
-labels: ''
+about: Suggest a new feature or improvement for the Lineage API
+title: 'feat: '
+labels: enhancement
 assignees: ''
-
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+**What problem does this solve?**
+A clear description of the problem or gap.
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+**Proposed solution**
+How you think it should work.
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
+**Upstream candidate?**
+Could this improvement benefit the upstream Gramps Web API project?
 
 **Additional context**
-Add any other context or screenshots about the feature request here.
+Any links, references, or related issues.
