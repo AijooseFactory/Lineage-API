@@ -197,6 +197,15 @@ class TreeUpdateBodyArgs(Schema):
             "description": "Minimum user role level required to use the AI chat endpoint."
         },
     )
+    system_prompt_ai = fields.Str(
+        required=False,
+        allow_none=True,
+        load_default=None,
+        metadata={
+            "description": "Custom system prompt for the AI assistant. "
+            "Pass an empty string to restore the server default."
+        },
+    )
 
 
 class TreeResource(ProtectedResource):
@@ -260,6 +269,16 @@ class TreeResource(ProtectedResource):
                 min_role_ai=args.get("min_role_ai"),
             )
             rv.update({"min_role_ai": args["min_role_ai"]})
+        # system_prompt_ai: empty string clears to null (restore default)
+        if "system_prompt_ai" in args and args["system_prompt_ai"] is not None:
+            prompt = args["system_prompt_ai"].strip()
+            if prompt:
+                set_tree_details(tree=tree_id, system_prompt_ai=prompt)
+                rv.update({"system_prompt_ai": prompt})
+            else:
+                # Empty string → clear custom prompt, restore server default
+                set_tree_details(tree=tree_id, clear_system_prompt_ai=True)
+                rv.update({"system_prompt_ai": None})
         return rv
 
 

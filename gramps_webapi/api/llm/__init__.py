@@ -17,6 +17,7 @@ from pydantic_ai.messages import (
 )
 
 from ..util import abort_with_message, get_logger
+from ...auth import get_tree_permissions
 from .agent import create_agent
 from .deps import AgentDeps
 
@@ -122,7 +123,13 @@ def answer_with_agent(
     model_name = config.get("LLM_MODEL")
     base_url = config.get("LLM_BASE_URL")
     max_context_length = config.get("LLM_MAX_CONTEXT_LENGTH", 50000)
-    system_prompt_override = config.get("LLM_SYSTEM_PROMPT")
+
+    # System prompt priority: per-tree DB setting → env var → hardcoded default
+    tree_perms = get_tree_permissions(tree) or {}
+    system_prompt_override = (
+        tree_perms.get("system_prompt_ai")
+        or config.get("LLM_SYSTEM_PROMPT")
+    )
 
     if not model_name:
         raise ValueError("No LLM model specified")

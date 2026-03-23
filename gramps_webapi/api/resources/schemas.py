@@ -2489,3 +2489,10 @@ class TreeSchema(_Base):
             "description": "Minimum user role required to use the AI chat endpoint."
         },
     )
+    system_prompt_ai = fields.Str(
+        allow_none=True,
+        metadata={
+            "description": "Custom system prompt for the AI chat assistant. "
+            "Overrides the server default when set. Null restores the default."
+        },
+    )

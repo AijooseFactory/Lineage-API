@@ -329,7 +329,12 @@ def create_app(config: Optional[Dict[str, Any]] = None, config_from_env: bool = 
 
     if app.config.get("VECTOR_EMBEDDING_MODEL"):
         app.config["_INITIALIZED_VECTOR_EMBEDDING_MODEL"] = load_model(
-            app.config["VECTOR_EMBEDDING_MODEL"]
+            app.config["VECTOR_EMBEDDING_MODEL"],
+            base_url=app.config.get("LLM_BASE_URL"),
+            # OLLAMA_API_KEY is read directly from the environment so it is
+            # never stored in Flask config (avoids accidental exposure in
+            # config dumps / telemetry).
+            api_key=os.getenv("OLLAMA_API_KEY"),
         )
 
     @app.route("/ready", methods=["GET"])

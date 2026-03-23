@@ -291,8 +291,15 @@ def get_permissions(username: str, tree: str) -> Set[str]:
     # check & add chat permissions
     query = user_db.session.query(Tree)  # pylint: disable=no-member
     tree_obj = query.filter_by(id=tree).scalar()
+    # Resolve the effective minimum role for AI chat.
+    # Priority: DB value (set via Manage Users UI) → DEFAULT_MIN_ROLE_AI config.
     if tree_obj and tree_obj.min_role_ai is not None:
-        if user.role >= tree_obj.min_role_ai:
+        effective_min_role_ai = tree_obj.min_role_ai
+    else:
+        from flask import current_app
+        effective_min_role_ai = current_app.config.get("DEFAULT_MIN_ROLE_AI")
+    if effective_min_role_ai is not None:
+        if user.role >= effective_min_role_ai:
             permissions.add(PERM_USE_CHAT)
     return permissions
 
@@ -394,13 +401,16 @@ def get_tree_usage(tree: str) -> Optional[dict[str, int]]:
     }
 
 
-def get_tree_permissions(tree: str) -> Optional[dict[str, int]]:
-    """Get tree permissions."""
+def get_tree_permissions(tree: str) -> Optional[dict]:
+    """Get tree permissions and AI configuration."""
     query = user_db.session.query(Tree)  # pylint: disable=no-member
     tree_obj: Tree = query.filter_by(id=tree).scalar()
     if tree_obj is None:
         return None
-    return {"min_role_ai": tree_obj.min_role_ai}
+    return {
+        "min_role_ai": tree_obj.min_role_ai,
+        "system_prompt_ai": tree_obj.system_prompt_ai,
+    }
 
 
 def set_tree_usage(
@@ -431,9 +441,17 @@ def set_tree_details(
     quota_media: Optional[int] = None,
     quota_people: Optional[int] = None,
     min_role_ai: Optional[int] = None,
+    system_prompt_ai: Optional[str] = None,
+    clear_system_prompt_ai: bool = False,
 ) -> None:
-    """Set the tree details like quotas and minimum role for chat."""
-    if quota_media is None and quota_people is None and min_role_ai is None:
+    """Set the tree details like quotas, minimum role for chat, and system prompt."""
+    if (
+        quota_media is None
+        and quota_people is None
+        and min_role_ai is None
+        and system_prompt_ai is None
+        and not clear_system_prompt_ai
+    ):
         return
     query = user_db.session.query(Tree)  # pylint: disable=no-member
     tree_obj = query.filter_by(id=tree).scalar()
@@ -445,6 +463,10 @@ def set_tree_details(
         tree_obj.quota_people = quota_people
     if min_role_ai is not None:
         tree_obj.min_role_ai = min_role_ai
+    if system_prompt_ai is not None:
+        tree_obj.system_prompt_ai = system_prompt_ai
+    if clear_system_prompt_ai:
+        tree_obj.system_prompt_ai = None
     user_db.session.add(tree_obj)  # pylint: disable=no-member
     user_db.session.commit()  # pylint: disable=no-member
 
@@ -552,6 +574,7 @@ class Tree(user_db.Model):  # type: ignore
     usage_people = mapped_column(sa.Integer)
     usage_ai = mapped_column(sa.Integer)
     min_role_ai = mapped_column(sa.Integer)
+    system_prompt_ai = mapped_column(sa.Text)
     enabled = mapped_column(sa.Integer, default=1, server_default="1")
 
     def __repr__(self):

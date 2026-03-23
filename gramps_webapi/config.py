@@ -89,6 +89,11 @@ class DefaultConfig(object):
     LLM_MAX_CONTEXT_LENGTH = 50000
     LLM_SYSTEM_PROMPT = None
     VECTOR_EMBEDDING_MODEL = ""
+    # Minimum user role required to use AI chat when the tree has no explicit
+    # min_role_ai set in the database.  None means chat is disabled by default
+    # (upstream behaviour).  Set to 4 (ROLE_OWNER) to enable chat for owners
+    # and administrators out of the box.
+    DEFAULT_MIN_ROLE_AI = None
     DISABLE_TELEMETRY = False
     OIDC_ISSUER = ""
     OIDC_CLIENT_ID = ""
