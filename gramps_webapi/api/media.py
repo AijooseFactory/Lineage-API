@@ -113,12 +113,34 @@ class MediaHandlerLocal(MediaHandlerBase):
         mime: str,
         path: Optional[FilenameOrPath] = None,
     ) -> None:
-        """Upload a file from a stream."""
+        """Upload a file from a stream.
+
+        If *path* is an absolute path that falls within *base_dir* it is made
+        relative in the usual way.  If it is an absolute path that does **not**
+        fall within *base_dir* (e.g. a legacy path from another machine such as
+        ``/Users/alice/Documents/FTM Media/photo.jpg``) the bare filename is
+        used instead and a warning is logged.  This prevents silent upload
+        failures for GEDCOM imports from applications that embed absolute host
+        paths in media references.
+        """
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+
         if path is not None:
             if Path(path).is_absolute():
-                # Don't allow absolute paths! This will raise
-                # if path is not relative to base_dir
-                rel_path: FilenameOrPath = Path(path).relative_to(self.base_dir)
+                try:
+                    rel_path: FilenameOrPath = Path(path).relative_to(self.base_dir)
+                except ValueError:
+                    # Absolute path is not within base_dir — fall back to the
+                    # bare filename so the file is still stored rather than lost.
+                    _log.warning(
+                        "MediaHandlerLocal.upload_file: absolute path %r is not "
+                        "within base_dir %r; storing as filename only: %r",
+                        path,
+                        self.base_dir,
+                        Path(path).name,
+                    )
+                    rel_path = Path(path).name
             else:
                 rel_path = path
             upload_file_local(self.base_dir, rel_path, stream)
