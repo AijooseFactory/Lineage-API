@@ -29,7 +29,11 @@ from typing import Any
 from pydantic_ai import RunContext
 
 from ..resources.filters import apply_filter
-from ..resources.util import get_one_relationship
+from ..resources.util import (
+    get_one_relationship,
+    get_all_relationships_string,
+    get_event_participants_for_handle,
+)
 from ..search import get_semantic_search_indexer
 from ..search.text import obj_strings_from_object
 from ..util import get_db_outside_request, get_logger
@@ -68,19 +72,23 @@ def _get_relationship_prefix(db_handle, anchor_person, result_person, logger) ->
         logger: Logger instance
 
     Returns:
-        A formatted relationship prefix like "[grandfather] " or empty string
+        A formatted relationship prefix like "[grandfather] " or "[grandfather, uncle] " or empty string
     """
     try:
-        rel_string, dist_orig, dist_other = get_one_relationship(
+        # Use get_all_relationships_string to catch double-relationships (endogamy)
+        rel_string = get_all_relationships_string(
             db_handle=db_handle,
             person1=anchor_person,
             person2=result_person,
-            depth=10,
+            depth=12,  # Increased depth for broader relationship detection
         )
         if rel_string and rel_string.lower() not in ["", "self"]:
             return f"[{rel_string}] "
-        elif dist_orig == 0 and dist_other == 0:
+        
+        # Fallback for self check if get_all_relationships_string is empty
+        if anchor_person.handle == result_person.handle:
             return "[self] "
+            
     except Exception as e:  # pylint: disable=broad-except
         logger.warning(
             "Error calculating relationship between %s and %s: %s",
@@ -318,7 +326,16 @@ def search_genealogy_database(
     # Limit max_results to reasonable bounds
     max_results = min(max(1, max_results), 50)
 
+    db_handle = None
     try:
+        # Use get_db_outside_request to avoid Flask's g caching
+        db_handle = get_db_outside_request(
+            tree=ctx.deps.tree,
+            view_private=ctx.deps.include_private,
+            readonly=True,
+            user_id=ctx.deps.user_id,
+        )
+
         searcher = get_semantic_search_indexer(ctx.deps.tree)
         _, hits = searcher.search(
             query=query,
@@ -336,8 +353,83 @@ def search_genealogy_database(
         per_item_max = 10000  # Maximum chars per individual item
         current_length = 0
 
+        # Get anchor person for relationship labeling
+        # Prioritize User Person over Home Person for personal context
+        anchor_person = None
+        if ctx.deps.user_person_handle:
+            try:
+                anchor_person = db_handle.get_person_from_handle(
+                    ctx.deps.user_person_handle
+                )
+            except Exception: # pylint: disable=broad-except
+                pass
+        elif ctx.deps.user_person_gramps_id:
+            try:
+                anchor_person = db_handle.get_person_from_gramps_id(
+                    ctx.deps.user_person_gramps_id
+                )
+            except Exception: # pylint: disable=broad-except
+                pass
+        
+        # Fall back to Home Person if user identity is not established
+        if not anchor_person:
+            if ctx.deps.home_person_handle:
+                try:
+                    anchor_person = db_handle.get_person_from_handle(
+                        ctx.deps.home_person_handle
+                    )
+                except Exception: # pylint: disable=broad-except
+                    pass
+            elif ctx.deps.home_person_gramps_id:
+                try:
+                    anchor_person = db_handle.get_person_from_gramps_id(
+                        ctx.deps.home_person_gramps_id
+                    )
+                except Exception: # pylint: disable=broad-except
+                    pass
+
         for hit in hits:
             content = hit.get("content", "")
+            obj_type = hit.get("object_type", "")
+            handle = hit.get("handle")
+            
+            # Resolve the "Subject" person for the hit to provide relationship context
+            subject_person = None
+            if anchor_person:
+                try:
+                    if obj_type == "person":
+                        subject_person = db_handle.get_person_from_handle(handle)
+                    elif obj_type == "event":
+                        participants = get_event_participants_for_handle(db_handle, handle)
+                        if participants["people"]:
+                            # Prioritize primary participants
+                            subject_person = next(
+                                (p for r, p in participants["people"] if r.is_primary()),
+                                participants["people"][0][1]
+                            )
+                    elif obj_type == "note":
+                        # Find first person referencing this note
+                        backlinks = db_handle.find_backlink_handles(
+                            handle, include_classes=["Person"]
+                        )
+                        if backlinks:
+                            _, p_handle = backlinks[0]
+                            subject_person = db_handle.get_person_from_handle(p_handle)
+                except Exception: # pylint: disable=broad-except
+                    pass
+
+            if subject_person and anchor_person:
+                try:
+                    rel_prefix = _get_relationship_prefix(
+                        db_handle, anchor_person, subject_person, logger
+                    )
+                    if obj_type == "person":
+                        content = rel_prefix + content
+                    else:
+                        person_name = str(subject_person.get_primary_name().get_name())
+                        content = f"{rel_prefix}{person_name}'s {obj_type.capitalize()}: {content}"
+                except Exception: # pylint: disable=broad-except
+                    pass
 
             # Truncate individual items if they're too long
             if len(content) > per_item_max:
@@ -360,6 +452,7 @@ def search_genealogy_database(
             context_parts.append(content)
             current_length += len(content) + 2
 
+        db_handle.close()
         result = "\n\n".join(context_parts)
         logger.debug(
             "Tool search_genealogy_database returned %d results (%d chars) for query: %r",
@@ -371,6 +464,8 @@ def search_genealogy_database(
 
     except Exception as e:  # pylint: disable=broad-except
         logger.error("Error searching genealogy database: %s", e)
+        if db_handle:
+            db_handle.close()
         return f"Error searching the database: {str(e)}"
 
 
@@ -446,6 +541,13 @@ def filter_people(
         - Find extended family (uncles, aunts): degrees_of_separation_from="I0044", degrees_of_separation=3
     """
     logger = get_logger()
+
+    # Default show_relation_with to User Person or Home Person if not provided
+    if not show_relation_with:
+        if ctx.deps.user_person_gramps_id:
+            show_relation_with = ctx.deps.user_person_gramps_id
+        elif ctx.deps.home_person_gramps_id:
+            show_relation_with = ctx.deps.home_person_gramps_id
 
     max_results = min(max(1, max_results), 100)
 
@@ -769,3 +871,581 @@ def filter_events(
         max_results=max_results,
         empty_message="No events found matching the filter criteria.",
     )
+
+
+# ── Historical Enslavement Research Tools ────────────────────────────────────
+
+# Keywords suggesting an enslaved person (search events, notes, attributes)
+_ENSLAVED_KEYWORDS: frozenset = frozenset([
+    "enslaved", "slave", "freedman", "freedwoman", "free person of color",
+    "fpc", "manumit", "manumission", "emancipat", "bondage", "bondsman",
+    "bondswoman", "chattel", "sold to", "purchased by", "listed in inventory",
+    "property of", "estate of", "tax list", "formerly enslaved",
+    "formerly a slave", "free black", "freedom papers", "liberation",
+])
+
+# Keywords suggesting an enslaver (search notes of enslaved ancestors)
+_ENSLAVER_KEYWORDS: frozenset = frozenset([
+    "enslaver", "slaveholder", "slave owner", "slaveowner", "planter",
+    "plantation owner", "held enslaved", "owned enslaved", "owned slaves",
+    "owned slave", "probate inventory", "estate inventory", "slave schedule",
+    "overseer", "listed enslaved", "his slaves", "her slaves", "their slaves",
+    "negroes", "list of negroes", "master was", "mistress was",
+    "belong to", "belonged to",
+])
+
+
+def _check_person_for_enslavement_evidence(
+    person,
+    db_handle,
+    include_private: bool,
+) -> list[str]:
+    """Return evidence strings if a person has enslaved-status indicators.
+
+    Checks events (type and description), notes, and attributes for
+    keywords associated with enslaved status.
+    """
+    evidence: list[str] = []
+
+    # ── Events ──
+    for event_ref in person.get_event_ref_list():
+        try:
+            event = db_handle.get_event_from_handle(event_ref.ref)
+            if not event:
+                continue
+            if not include_private and event.private:
+                continue
+
+            type_str = str(event.get_type()).lower()
+            desc_str = event.get_description().lower()
+
+            for kw in _ENSLAVED_KEYWORDS:
+                if kw in type_str:
+                    yr = event.get_date_object().get_year()
+                    year_str = f" ({yr})" if yr else ""
+                    evidence.append(f"Event[{event.get_type()}{year_str}]")
+                    break
+
+            # Only check description if type didn't already match
+            if not any("Event[" in e for e in evidence):
+                for kw in _ENSLAVED_KEYWORDS:
+                    if kw in desc_str:
+                        evidence.append(
+                            f"Event desc: '{event.get_description()[:100]}'"
+                        )
+                        break
+        except Exception:  # pylint: disable=broad-except
+            continue
+
+    # ── Notes ──
+    for note_handle in person.get_note_list():
+        try:
+            note = db_handle.get_note_from_handle(note_handle)
+            if not note:
+                continue
+            if not include_private and note.private:
+                continue
+            note_text = note.get().lower()
+            for kw in _ENSLAVED_KEYWORDS:
+                if kw in note_text:
+                    evidence.append(f"Note mentions '{kw}'")
+                    break
+        except Exception:  # pylint: disable=broad-except
+            continue
+
+    # ── Attributes ──
+    for attr in person.get_attribute_list():
+        try:
+            if not include_private and attr.private:
+                continue
+            combined = (str(attr.get_type()) + " " + attr.get_value()).lower()
+            for kw in _ENSLAVED_KEYWORDS:
+                if kw in combined:
+                    evidence.append(
+                        f"Attribute: {attr.get_type()} = {attr.get_value()}"
+                    )
+                    break
+        except Exception:  # pylint: disable=broad-except
+            continue
+
+    return evidence
+
+
+def _extract_enslaver_references_from_person(
+    person,
+    db_handle,
+    include_private: bool,
+) -> list[str]:
+    """Return enslaver-reference snippets from a person's notes and events.
+
+    Scans notes and event descriptions for mentions of enslavers, planters,
+    slave owners, etc.  Returns short contextual excerpts (≤200 chars).
+    """
+    refs: list[str] = []
+
+    # ── Notes ──
+    for note_handle in person.get_note_list():
+        try:
+            note = db_handle.get_note_from_handle(note_handle)
+            if not note:
+                continue
+            if not include_private and note.private:
+                continue
+            raw = note.get()
+            lower = raw.lower()
+            for kw in _ENSLAVER_KEYWORDS:
+                idx = lower.find(kw)
+                if idx != -1:
+                    start = max(0, idx - 60)
+                    end = min(len(raw), idx + 140)
+                    snippet = raw[start:end].strip().replace("\n", " ")
+                    refs.append(f"Note: '…{snippet}…'")
+                    break  # one snippet per note
+        except Exception:  # pylint: disable=broad-except
+            continue
+
+    # ── Event descriptions ──
+    for event_ref in person.get_event_ref_list():
+        try:
+            event = db_handle.get_event_from_handle(event_ref.ref)
+            if not event:
+                continue
+            if not include_private and event.private:
+                continue
+            desc = event.get_description()
+            for kw in _ENSLAVER_KEYWORDS:
+                if kw in desc.lower():
+                    refs.append(f"Event desc: '{desc[:120]}'")
+                    break
+        except Exception:  # pylint: disable=broad-except
+            continue
+
+    return refs
+
+
+@log_tool_call
+def get_enslaved_ancestors(
+    ctx: RunContext[AgentDeps],
+    person_id: str = "",
+    max_generations: int = 8,
+    max_results: int = 50,
+) -> str:
+    """Find ancestors with documentary evidence of being enslaved.
+
+    Walks the ancestor chain of the specified person (or the Home Person by
+    default) and checks each ancestor's events, notes, and attributes for
+    enslaved-status indicators: event types such as "Slave" / "Freedman" /
+    "Manumission", event descriptions, notes referencing enslavement, and
+    attributes marking enslaved status.
+
+    Use this tool when the user asks about enslaved ancestors, which ancestors
+    were enslaved, ancestry connected to plantation slavery, freedmen/freedwomen
+    lineage, or similar slavery-era history questions.
+
+    Args:
+        person_id: Gramps ID of the anchor person whose ancestors to search
+                   (e.g., "I0001"). Defaults to the Home Person.
+        max_generations: Generations back to search (default: 8, max: 15).
+        max_results: Maximum results to return (default: 50, max: 100).
+
+    Returns:
+        Formatted text listing ancestors with enslaved-status evidence,
+        including relationship labels and the evidence type found.
+    """
+    logger = get_logger()
+
+    # Resolve anchor person
+    if not person_id:
+        person_id = (
+            ctx.deps.home_person_gramps_id or ctx.deps.user_person_gramps_id
+        )
+    if not person_id:
+        return (
+            "No anchor person specified and no Home Person is configured. "
+            "Please provide a Gramps ID (e.g., person_id='I0001')."
+        )
+
+    max_generations = min(max(1, max_generations), 15)
+    max_results = min(max(1, max_results), 100)
+
+    db_handle = None
+    try:
+        db_handle = get_db_outside_request(
+            tree=ctx.deps.tree,
+            view_private=ctx.deps.include_private,
+            readonly=True,
+            user_id=ctx.deps.user_id,
+        )
+
+        # Verify anchor person exists
+        anchor = db_handle.get_person_from_gramps_id(person_id)
+        if not anchor:
+            db_handle.close()
+            return f"Person {person_id} not found in the database."
+
+        # Get all ancestors using Gramps filter
+        ancestor_rules = json.dumps({
+            "rules": [{
+                "name": "IsLessThanNthGenerationAncestorOf",
+                "values": [person_id, str(max_generations + 1)],
+            }]
+        })
+        ancestor_handles = apply_filter(
+            db_handle=db_handle,
+            args={"rules": ancestor_rules},
+            namespace="Person",
+            handles=None,
+        )
+
+        if not ancestor_handles:
+            db_handle.close()
+            return (
+                f"No ancestors found for {person_id} within "
+                f"{max_generations} generations."
+            )
+
+        logger.debug(
+            "get_enslaved_ancestors: checking %d ancestors of %s",
+            len(ancestor_handles),
+            person_id,
+        )
+
+        results: list[str] = []
+        from ..search.text import obj_strings_from_object
+
+        for handle in ancestor_handles:
+            if len(results) >= max_results:
+                break
+            try:
+                person = db_handle.get_person_from_handle(handle)
+                if not person:
+                    continue
+                if not ctx.deps.include_private and person.private:
+                    continue
+
+                evidence = _check_person_for_enslavement_evidence(
+                    person, db_handle, ctx.deps.include_private
+                )
+                if not evidence:
+                    continue
+
+                # Get full person record text
+                obj_dict = obj_strings_from_object(
+                    db_handle=db_handle,
+                    class_name="Person",
+                    obj=person,
+                    semantic=True,
+                )
+                content = ""
+                if obj_dict:
+                    content = (
+                        obj_dict["string_all"]
+                        if ctx.deps.include_private
+                        else obj_dict["string_public"]
+                    )
+
+                # Get relationship label relative to anchor
+                rel_prefix = ""
+                try:
+                    rel_prefix = _get_relationship_prefix(
+                        db_handle, anchor, person, logger
+                    )
+                except Exception:  # pylint: disable=broad-except
+                    pass
+
+                evidence_str = " | ".join(evidence[:5])
+                entry = (
+                    f"{rel_prefix}EVIDENCE: {evidence_str}\n"
+                    f"{content[:2000] if content else person.gramps_id}"
+                )
+                results.append(entry)
+
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug(
+                    "Error checking ancestor %s for enslavement: %s", handle, exc
+                )
+                continue
+
+        db_handle.close()
+
+        if not results:
+            return (
+                f"No ancestors of {person_id} within {max_generations} generations "
+                "have documentary evidence of being enslaved in the current database. "
+                "This does not mean they were not enslaved — records may be missing. "
+                "Use hybrid_search or search_genealogy_database to search notes "
+                "for plantation, enslavement, or slavery keywords."
+            )
+
+        header = (
+            f"Found {len(results)} ancestor(s) of {person_id} with "
+            f"enslaved-status evidence (searched {len(ancestor_handles)} ancestors "
+            f"across {max_generations} generations):\n\n"
+        )
+        return header + "\n\n---\n\n".join(results)
+
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("get_enslaved_ancestors error: %s", exc)
+        if db_handle is not None:
+            try:
+                db_handle.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
+        return f"Error finding enslaved ancestors: {str(exc)}"
+
+
+@log_tool_call
+def get_enslavers_of_ancestors(
+    ctx: RunContext[AgentDeps],
+    person_id: str = "",
+    max_generations: int = 8,
+    max_results: int = 30,
+) -> str:
+    """Find enslavers mentioned in the records of enslaved ancestors.
+
+    Scans the notes, events, and attributes of enslaved ancestors of the
+    specified person for references to enslavers, slave owners, plantation
+    owners, probate records, estate inventories, and similar documents.
+    Returns contextual excerpts naming or describing the enslaving parties.
+
+    Use this tool when the user asks who enslaved their ancestors, which
+    plantation their ancestors lived on, who the slave owner was, or asks
+    for enslavers by name.
+
+    Args:
+        person_id: Gramps ID of the anchor person whose enslaved ancestors
+                   to investigate (e.g., "I0001"). Defaults to the Home Person.
+        max_generations: Generations back to search (default: 8, max: 15).
+        max_results: Maximum enslaved ancestors to examine (default: 30, max: 100).
+
+    Returns:
+        Formatted text with enslaver references found in the records, grouped
+        by the enslaved ancestor they relate to.
+    """
+    logger = get_logger()
+
+    # Resolve anchor person
+    if not person_id:
+        person_id = (
+            ctx.deps.home_person_gramps_id or ctx.deps.user_person_gramps_id
+        )
+    if not person_id:
+        return (
+            "No anchor person specified and no Home Person is configured. "
+            "Please provide a Gramps ID (e.g., person_id='I0001')."
+        )
+
+    max_generations = min(max(1, max_generations), 15)
+    max_results = min(max(1, max_results), 100)
+
+    db_handle = None
+    try:
+        db_handle = get_db_outside_request(
+            tree=ctx.deps.tree,
+            view_private=ctx.deps.include_private,
+            readonly=True,
+            user_id=ctx.deps.user_id,
+        )
+
+        anchor = db_handle.get_person_from_gramps_id(person_id)
+        if not anchor:
+            db_handle.close()
+            return f"Person {person_id} not found in the database."
+
+        # Get all ancestors
+        ancestor_rules = json.dumps({
+            "rules": [{
+                "name": "IsLessThanNthGenerationAncestorOf",
+                "values": [person_id, str(max_generations + 1)],
+            }]
+        })
+        ancestor_handles = apply_filter(
+            db_handle=db_handle,
+            args={"rules": ancestor_rules},
+            namespace="Person",
+            handles=None,
+        )
+
+        if not ancestor_handles:
+            db_handle.close()
+            return f"No ancestors found for {person_id} within {max_generations} generations."
+
+        results: list[str] = []
+        enslaved_checked = 0
+        from ..search.text import obj_strings_from_object
+
+        for handle in ancestor_handles:
+            if enslaved_checked >= max_results:
+                break
+            try:
+                person = db_handle.get_person_from_handle(handle)
+                if not person:
+                    continue
+                if not ctx.deps.include_private and person.private:
+                    continue
+
+                # Only scan people who have enslaved evidence
+                enslavement_evidence = _check_person_for_enslavement_evidence(
+                    person, db_handle, ctx.deps.include_private
+                )
+                if not enslavement_evidence:
+                    continue
+
+                enslaved_checked += 1
+                enslaver_refs = _extract_enslaver_references_from_person(
+                    person, db_handle, ctx.deps.include_private
+                )
+                if not enslaver_refs:
+                    continue
+
+                # Get person name for display
+                primary = person.get_primary_name()
+                name = primary.get_name() if primary else person.gramps_id
+
+                # Get relationship label
+                rel_prefix = ""
+                try:
+                    rel_prefix = _get_relationship_prefix(
+                        db_handle, anchor, person, logger
+                    )
+                except Exception:  # pylint: disable=broad-except
+                    pass
+
+                enslaver_str = "\n  ".join(enslaver_refs[:5])
+                results.append(
+                    f"{rel_prefix}ENSLAVED ANCESTOR: {name} [{person.gramps_id}]\n"
+                    f"  ENSLAVER REFERENCES:\n  {enslaver_str}"
+                )
+
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("Error examining ancestor %s: %s", handle, exc)
+                continue
+
+        db_handle.close()
+
+        if not results:
+            if enslaved_checked == 0:
+                return (
+                    f"No ancestors of {person_id} within {max_generations} generations "
+                    "have documentary evidence of being enslaved. "
+                    "Use get_enslaved_ancestors first to confirm enslaved status, "
+                    "or use hybrid_search to look for plantation/enslavement records."
+                )
+            return (
+                f"Found {enslaved_checked} ancestor(s) with enslaved-status evidence, "
+                "but none of their records contain explicit enslaver references "
+                "(planter names, estate owners, probate records, etc.). "
+                "The enslaver's name may be in unlinked sources — try "
+                "hybrid_search with queries like 'plantation owner', 'slave schedule', "
+                "or 'probate estate'."
+            )
+
+        header = (
+            f"Found enslaver references in the records of {len(results)} "
+            f"enslaved ancestor(s) of {person_id} "
+            f"(searched {len(ancestor_handles)} ancestors across "
+            f"{max_generations} generations):\n\n"
+        )
+        return header + "\n\n---\n\n".join(results)
+
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("get_enslavers_of_ancestors error: %s", exc)
+        if db_handle is not None:
+            try:
+                db_handle.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
+        return f"Error finding enslaver references: {str(exc)}"
+
+
+# ── Lineage Hybrid GraphRAG Tool ────────────────────────────────────────────
+
+
+@log_tool_call
+def hybrid_search(
+    ctx: RunContext[AgentDeps],
+    query: str,
+    gender: str = "",
+    birth_year_before: str = "",
+    birth_year_after: str = "",
+    place_contains: str = "",
+    relationship_type: str = "",
+    relationship_target_id: str = "",
+    max_hops: int = 6,
+    max_results: int = 20,
+) -> str:
+    """Search using Lineage Hybrid GraphRAG — combines semantic search
+    over notes, media, and sources with graph-based relationship reasoning.
+
+    Use this tool for complex questions that combine free-text evidence
+    with relationship or kinship constraints. For simple lookups of
+    specific people, events, or places, use the filter tools instead.
+
+    Args:
+        query: Natural language search query
+        gender: Filter by gender ("male", "female", "unknown")
+        birth_year_before: Born before this year (e.g., "1900")
+        birth_year_after: Born after this year (e.g., "1800")
+        place_contains: Place name filter (e.g., "Virginia")
+        relationship_type: Relationship constraint ("ancestor", "descendant", "related")
+        relationship_target_id: Gramps ID for relationship anchor (e.g., "I0001")
+        max_hops: Maximum relationship hops (default: 6)
+        max_results: Maximum results to return (default: 20)
+    """
+    logger = get_logger()
+
+    try:
+        from ..lineage.intent_parser import parse_intent_from_args
+        from ..lineage.retriever import hybrid_retrieve
+
+        # Default relationship target to User Person or Home Person if not provided
+        if relationship_type and not relationship_target_id:
+            if ctx.deps.user_person_gramps_id:
+                relationship_target_id = ctx.deps.user_person_gramps_id
+            elif ctx.deps.home_person_gramps_id:
+                relationship_target_id = ctx.deps.home_person_gramps_id
+
+        intent = parse_intent_from_args(
+            query=query,
+            gender=gender,
+            birth_year_before=birth_year_before,
+            birth_year_after=birth_year_after,
+            place_contains=place_contains,
+            relationship_type=relationship_type,
+            relationship_target_id=relationship_target_id,
+            max_hops=max_hops,
+            max_results=min(max_results, 50),
+        )
+
+        bundle = hybrid_retrieve(
+            query=query,
+            tree=ctx.deps.tree,
+            user_id=ctx.deps.user_id,
+            include_private=ctx.deps.include_private,
+            intent=intent,
+        )
+
+        result = bundle.to_text(max_length=ctx.deps.max_context_length)
+        logger.debug(
+            "hybrid_search returned %d results (sources: %s, partial: %s)",
+            len(bundle.results),
+            bundle.sources_used,
+            bundle.partial,
+        )
+        return result
+
+    except ImportError:
+        logger.warning(
+            "Hybrid search not available — graphrag dependencies not installed"
+        )
+        return (
+            "Hybrid search is not available. Please use the "
+            "search_genealogy_database tool or filter tools instead."
+        )
+    except Exception as exc:
+        logger.error("hybrid_search failed: %s", exc, exc_info=True)
+        return (
+            "Hybrid search encountered an error. Please try using "
+            "search_genealogy_database or filter tools as a fallback."
+        )
+

@@ -54,6 +54,7 @@ from .resources.util import (
     transaction_to_json,
 )
 from .search import get_search_indexer, get_semantic_search_indexer
+from .lineage import is_projection_enabled
 from .telemetry import (
     get_telemetry_payload,
     send_telemetry,
@@ -271,6 +272,12 @@ def import_file(
                 self, title="Updating semantic search index..."
             ),
         )
+    # ── Lineage projection (async, after import) ──
+    if is_projection_enabled():
+        from .lineage.projection_tasks import projection_reindex_full
+
+        set_progress_title(self, title="Updating Lineage graph/vector projections...")
+        run_task(projection_reindex_full, tree=tree, user_id=user_id)
 
 
 @shared_task(bind=True)
@@ -476,6 +483,11 @@ def delete_objects(
                 self, title="Updating semantic search index..."
             ),
         )
+    # ── Lineage projection (async, after delete) ──
+    if is_projection_enabled():
+        from .lineage.projection_tasks import projection_reindex_full
+
+        run_task(projection_reindex_full, tree=tree, user_id=user_id)
 
 
 @shared_task(bind=True)
@@ -560,6 +572,18 @@ def process_transactions(
                     semantic_indexer.delete_object(handle, class_name)
                 else:
                     semantic_indexer.add_or_update_object(handle, db_handle, class_name)
+        # ── Lineage projection (async, per-object) ──
+        if is_projection_enabled():
+            from .lineage.projection_tasks import projection_update_incremental
+
+            for _trans_dict in trans_dict:
+                run_task(
+                    projection_update_incremental,
+                    tree=tree,
+                    handle=_trans_dict["handle"],
+                    class_name=_trans_dict["_class"],
+                    user_id=user_id,
+                )
     finally:
         close_db(db_handle)
     return trans_dict
@@ -648,12 +672,14 @@ def process_chat(
     include_private: bool,
     history: list | None = None,
     verbose: bool = False,
+    home_person_gramps_id: str | None = None,
 ) -> dict[str, Any]:
     """Process a chat query with the AI agent."""
     # import here to avoid error if AI dependencies are not installed
     from gramps_webapi.api.llm import (
         answer_with_agent,
         extract_metadata_from_result,
+        extract_thought_block,
         sanitize_answer,
     )
 
@@ -663,10 +689,25 @@ def process_chat(
         include_private=include_private,
         user_id=user_id,
         history=history,
+        frontend_home_person_gramps_id=home_person_gramps_id,
     )
 
-    response_text = sanitize_answer(result.response.text or "")
-    response_dict: dict[str, Any] = {"response": response_text}
+    # result.data is the canonical pydantic-ai result string.
+    # Fall back to result.response.text for older pydantic-ai versions.
+    raw_text: str = ""
+    if hasattr(result, "data") and isinstance(result.data, str):
+        raw_text = result.data
+    elif hasattr(result, "response") and hasattr(result.response, "text"):
+        raw_text = result.response.text or ""
+
+    # Strip native thinking-model tokens (<think>) and split off the
+    # instructed <thought> reasoning block from the final prose answer.
+    cleaned = sanitize_answer(raw_text)
+    thought, answer = extract_thought_block(cleaned)
+
+    response_dict: dict[str, Any] = {"response": answer}
+    if thought:
+        response_dict["thought"] = thought
 
     if verbose:
         response_dict["metadata"] = extract_metadata_from_result(result)

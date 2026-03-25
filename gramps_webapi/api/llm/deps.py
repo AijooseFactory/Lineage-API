@@ -30,3 +30,10 @@ class AgentDeps:
     include_private: bool
     max_context_length: int
     user_id: str
+    home_person_handle: str = ""
+    home_person_name: str = ""
+    home_person_gramps_id: str = ""
+    home_person_possessive: str = "their"
+    user_person_handle: str = ""
+    user_person_gramps_id: str = ""
+    agent_name: str = ""
