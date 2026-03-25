@@ -357,9 +357,28 @@ def _sanitize_media_patched(db, media):
 
 
 def get_db_manager(tree: str | None) -> WebDbManager:
-    """Get an appropriate WebDbManager instance."""
+    """Get an appropriate WebDbManager instance.
+
+    In multi-tree mode the JWT ``tree`` claim is a UUID dirname that maps
+    directly to a Gramps database folder.  In single-tree mode it is the
+    human-readable tree name (e.g. ``"Lineage"``), which must be resolved
+    to the underlying UUID dirname via Gramps' own tree manager.
+
+    Strategy: if ``tree`` is an existing subdirectory of the Gramps database
+    path, use it as a ``dirname`` directly (multi-tree / UUID case).
+    Otherwise fall back to a ``name``-based lookup so Gramps resolves the
+    folder itself (single-tree / name case).
+    """
+    import os
+
+    from gramps.gen.config import config as gramps_config
+
+    db_dir = gramps_config.get("database.path") or ""
+    use_dirname = bool(tree and db_dir and os.path.isdir(os.path.join(db_dir, tree)))
+
     return WebDbManager(
-        dirname=tree,
+        dirname=tree if use_dirname else None,
+        name=None if use_dirname else tree,
         username=current_app.config["POSTGRES_USER"],
         password=current_app.config["POSTGRES_PASSWORD"],
         create_if_missing=False,
