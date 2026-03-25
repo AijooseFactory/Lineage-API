@@ -1111,7 +1111,6 @@ def get_enslaved_ancestors(
         )
 
         results: list[str] = []
-        from ..search.text import obj_strings_from_object
 
         for handle in ancestor_handles:
             if len(results) >= max_results:
@@ -1272,7 +1271,6 @@ def get_enslavers_of_ancestors(
 
         results: list[str] = []
         enslaved_checked = 0
-        from ..search.text import obj_strings_from_object
 
         for handle in ancestor_handles:
             if enslaved_checked >= max_results:
